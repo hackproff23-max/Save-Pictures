@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.ContentValues
 import android.graphics.*
+import android.graphics.pdf.PdfRenderer
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.*
@@ -54,8 +55,10 @@ class MainActivity : Activity() {
         web = WebView(this)
         web.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = UA; mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW }
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        web.setDownloadListener { u, _, _, mime, _ -> if (!intercept(u) && mime?.contains("pdf") == true) openPdf(u) }
         web.webViewClient = object : WebViewClient() {
             override fun onPageStarted(v: WebView, u: String, f: Bitmap?) { urlBox.setText(u) }
+            override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean = intercept(r.url.toString())
         }
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(v: WebView, p: Int) { bar.progress = p; bar.visibility = if (p >= 100) View.GONE else View.VISIBLE }
@@ -200,6 +203,121 @@ class MainActivity : Activity() {
             ui.post { Toast.makeText(this, "$ok imagem(ns) salvas em Pictures/Save Pictures", Toast.LENGTH_LONG).show() }
         }.start()
     }
+
+    fun msg(t: String) { ui.post { Toast.makeText(this, t, Toast.LENGTH_LONG).show() } }
+
+    fun intercept(u: String): Boolean {
+        val p = u.substringBefore("?").substringBefore("#").lowercase()
+        return when {
+            p.endsWith(".pdf") -> { openPdf(u); true }
+            Regex(".*\\.(jpe?g|png|webp|gif|bmp)").matches(p) -> { openImage(u); true }
+            else -> false
+        }
+    }
+
+    fun download(u: String, ref: String, f: File): Boolean = try {
+        val c = URL(u).openConnection() as HttpURLConnection
+        c.connectTimeout = 10000; c.readTimeout = 20000
+        c.setRequestProperty("User-Agent", UA); c.setRequestProperty("Referer", ref)
+        CookieManager.getInstance().getCookie(u)?.let { c.setRequestProperty("Cookie", it) }
+        if (c.responseCode != 200) false else { c.inputStream.use { i -> f.outputStream().use { o -> i.copyTo(o) } }; true }
+    } catch (e: Exception) { false }
+
+    fun openPdf(u: String) {
+        Toast.makeText(this, "Abrindo desenho...", Toast.LENGTH_SHORT).show()
+        val ref = web.url ?: ""
+        pool.execute {
+            val f = File(cacheDir, "v_" + u.hashCode() + ".pdf")
+            if (!download(u, ref, f)) { msg("Erro ao baixar o desenho"); return@execute }
+            try {
+                val r = PdfRenderer(ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY))
+                val pg = r.openPage(0)
+                val sc = 2000f / pg.width
+                val bm = Bitmap.createBitmap(2000, (pg.height * sc).toInt(), Bitmap.Config.ARGB_8888)
+                bm.eraseColor(Color.WHITE)
+                pg.render(bm, null, Matrix().apply { setScale(sc, sc) }, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                pg.close(); r.close()
+                ui.post { viewer(bm, f) }
+            } catch (e: Exception) { msg("Erro ao abrir: ${e.message}") }
+        }
+    }
+
+    fun openImage(u: String) {
+        Toast.makeText(this, "Abrindo imagem...", Toast.LENGTH_SHORT).show()
+        val ref = web.url ?: ""
+        pool.execute {
+            val f = File(cacheDir, "v_" + u.hashCode() + ".img")
+            if (!download(u, ref, f)) { msg("Erro ao baixar a imagem"); return@execute }
+            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(f.path, o)
+            val o2 = BitmapFactory.Options().apply { inSampleSize = Math.max(1, Math.max(o.outWidth, o.outHeight) / 2500) }
+            val bm = BitmapFactory.decodeFile(f.path, o2)
+            if (bm == null) msg("Formato não suportado") else ui.post { viewer(bm, null) }
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    fun viewer(bm: Bitmap, pdf: File?) {
+        val d = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val root = FrameLayout(this); root.setBackgroundColor(Color.BLACK)
+        val img = ImageView(this); img.setImageBitmap(bm); img.scaleType = ImageView.ScaleType.FIT_CENTER
+        root.addView(img, FrameLayout.LayoutParams(-1, -1))
+        var sc = 1f; var lx = 0f; var ly = 0f; var last = 0
+        val sd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(g: ScaleGestureDetector): Boolean {
+                sc = (sc * g.scaleFactor).coerceIn(1f, 6f); img.scaleX = sc; img.scaleY = sc; return true
+            }
+        })
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                sc = 1f; img.scaleX = 1f; img.scaleY = 1f; img.translationX = 0f; img.translationY = 0f; return true
+            }
+        })
+        root.setOnTouchListener { _, e ->
+            sd.onTouchEvent(e); gd.onTouchEvent(e)
+            if (e.pointerCount == 1 && !sd.isInProgress) {
+                if (last != 1 || e.action == MotionEvent.ACTION_DOWN) { lx = e.rawX; ly = e.rawY }
+                else if (e.action == MotionEvent.ACTION_MOVE && sc > 1f) {
+                    img.translationX += e.rawX - lx; img.translationY += e.rawY - ly; lx = e.rawX; ly = e.rawY
+                }
+            }
+            last = e.pointerCount; true
+        }
+        val bar = LinearLayout(this); bar.setBackgroundColor(0xAA000000.toInt()); bar.setPadding(dp(8), dp(8), dp(8), dp(8))
+        val bs = ArrayList<Button>()
+        bs.add(Button(this).apply { text = "Fechar"; setOnClickListener { d.dismiss() } })
+        bs.add(Button(this).apply { text = "Salvar imagem"; setOnClickListener { savePng(bm) } })
+        if (pdf != null) bs.add(Button(this).apply { text = "Salvar PDF"; setOnClickListener { savePdf(pdf) } })
+        for (b in bs) bar.addView(b, LinearLayout.LayoutParams(0, -2, 1f))
+        root.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+        d.setContentView(root); d.show()
+    }
+
+    fun savePng(bm: Bitmap) = Thread {
+        try {
+            val cv = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "desenho_${System.currentTimeMillis()}.png")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Save Pictures")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)!!
+            contentResolver.openOutputStream(uri)!!.use { bm.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            msg("Salvo em Pictures/Save Pictures")
+        } catch (e: Exception) { msg("Erro ao salvar") }
+    }.start()
+
+    fun savePdf(f: File) = Thread {
+        try {
+            val cv = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, "desenho_${System.currentTimeMillis()}.pdf")
+                put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                put(MediaStore.Downloads.RELATIVE_PATH, "Download/Save Pictures")
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)!!
+            contentResolver.openOutputStream(uri)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+            msg("PDF salvo em Download/Save Pictures")
+        } catch (e: Exception) { msg("Erro ao salvar PDF") }
+    }.start()
 
     val JS = """(function(){var s=new Set();
 function add(u){if(!u)return;try{u=new URL(u,document.baseURI).href;}catch(e){return;}if(/^(https?:|data:image)/.test(u))s.add(u);}
